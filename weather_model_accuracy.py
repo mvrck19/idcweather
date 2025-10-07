@@ -764,9 +764,9 @@ def main(
     latitude: Optional[float] = typer.Option(None, "--lat", "-l", help="Latitude of the location"),
     longitude: Optional[float] = typer.Option(None, "--lon", "-g", help="Longitude of the location"),
     days: int = typer.Option(7, "--days", "-d", help="Number of days to analyze (1-14)", min=1, max=14),
-    forecast_type: str = typer.Option("daily", "--forecast-type", "-ft", help="Forecast type: daily or hourly"),
-    forecast_days: int = typer.Option(7, "--forecast-days", "-fd", help="Days for daily forecast (3, 7, 14)", min=3, max=14),
-    forecast_hours: int = typer.Option(48, "--forecast-hours", "-fh", help="Hours for hourly forecast (24, 48, 72, 120)", min=24, max=120),
+    forecast_type: Optional[str] = typer.Option(None, "--forecast-type", "-ft", help="Forecast type: daily or hourly"),
+    forecast_days: Optional[int] = typer.Option(None, "--forecast-days", "-fd", help="Days for daily forecast (3, 7, 14)", min=3, max=14),
+    forecast_hours: Optional[int] = typer.Option(None, "--forecast-hours", "-fh", help="Hours for hourly forecast (24, 48, 72, 120)", min=24, max=120),
     no_cache: bool = typer.Option(False, "--no-cache", help="Force re-analysis, ignore cache"),
     show_cache_flag: bool = typer.Option(False, "--show-cache", help="Display cached results and exit"),
     clear_cache_flag: bool = typer.Option(False, "--clear-cache", help="Clear cache and exit"),
@@ -828,15 +828,47 @@ def main(
         console.print(f"\n[green]Selected: {location_str}[/green]")
         console.print(f"[dim]Coordinates: {latitude:.4f}, {longitude:.4f}[/dim]\n")
 
-    # Get coordinates if not provided
+    # Get location if not provided - prioritize city search in interactive mode
     if latitude is None or longitude is None:
-        console.print("\n[yellow]Enter your location coordinates:[/yellow]")
-        console.print("(Find yours at https://www.latlong.net/ or use --city flag)\n")
+        # First, try to get city name
+        if city is None:
+            console.print("\n[yellow]Enter your location:[/yellow]")
+            city_input = typer.prompt("City name (or press Enter to use coordinates)", default="", show_default=False)
 
-        if latitude is None:
-            latitude = typer.prompt("Latitude", type=float)
-        if longitude is None:
-            longitude = typer.prompt("Longitude", type=float)
+            if city_input.strip():
+                # User provided city name, search for it
+                console.print(f"\n[cyan]Searching for: {city_input}...[/cyan]")
+                locations = geocode_location(city_input)
+
+                if locations:
+                    selected = select_location(locations)
+                    if selected:
+                        latitude = selected.get("latitude")
+                        longitude = selected.get("longitude")
+                        city_name = selected.get("name", "Unknown")
+                        country = selected.get("country", "")
+                        admin1 = selected.get("admin1", "")
+
+                        # Build location string
+                        if admin1:
+                            location_str = f"{city_name}, {admin1}, {country}"
+                        else:
+                            location_str = f"{city_name}, {country}"
+
+                        console.print(f"\n[green]Selected: {location_str}[/green]")
+                        console.print(f"[dim]Coordinates: {latitude:.4f}, {longitude:.4f}[/dim]\n")
+                else:
+                    console.print(f"[yellow]No locations found for '{city_input}'.[/yellow]")
+
+        # Fall back to coordinates if still not provided
+        if latitude is None or longitude is None:
+            console.print("\n[yellow]Enter your location coordinates:[/yellow]")
+            console.print("(Find yours at https://www.latlong.net/)\n")
+
+            if latitude is None:
+                latitude = typer.prompt("Latitude", type=float)
+            if longitude is None:
+                longitude = typer.prompt("Longitude", type=float)
 
     # Validate coordinates
     if not (-90 <= latitude <= 90):
@@ -850,10 +882,36 @@ def main(
     if not location_str:
         location_str = f"Lat {latitude:.4f}, Lon {longitude:.4f}"
 
+    # Prompt for forecast preferences if not provided
+    if forecast_type is None:
+        console.print("\n[yellow]Forecast preferences:[/yellow]")
+        forecast_type_input = typer.prompt("Forecast type (daily/hourly)", default="daily", show_default=True)
+        forecast_type = forecast_type_input.lower()
+
     # Validate forecast type
     if forecast_type not in ["daily", "hourly"]:
         console.print("[red]Error: forecast-type must be 'daily' or 'hourly'[/red]")
         raise typer.Exit(code=1)
+
+    # Prompt for duration if not provided
+    if forecast_type == "daily" and forecast_days is None:
+        forecast_days = typer.prompt("Number of days to forecast", default=7, type=int, show_default=True)
+        # Validate range
+        if not (3 <= forecast_days <= 14):
+            console.print("[red]Error: Days must be between 3 and 14[/red]")
+            raise typer.Exit(code=1)
+    elif forecast_type == "hourly" and forecast_hours is None:
+        forecast_hours = typer.prompt("Number of hours to forecast", default=48, type=int, show_default=True)
+        # Validate range
+        if not (24 <= forecast_hours <= 120):
+            console.print("[red]Error: Hours must be between 24 and 120[/red]")
+            raise typer.Exit(code=1)
+
+    # Set defaults if still None
+    if forecast_days is None:
+        forecast_days = 7
+    if forecast_hours is None:
+        forecast_hours = 48
 
     # Determine forecast duration
     forecast_duration = forecast_days if forecast_type == "daily" else forecast_hours
