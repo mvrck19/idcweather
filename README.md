@@ -23,11 +23,32 @@ Different weather models perform differently across regions. This tool:
 
 ## Installation
 
+No API key or account needed — it uses [Open-Meteo](https://open-meteo.com/)'s free, unauthenticated APIs.
+
+### Install directly (recommended)
+
 ```bash
+pip install git+https://github.com/mvrck19/idcweather
+```
+
+This puts a `weather-model-accuracy` command on your PATH — no cloning required:
+
+```bash
+weather-model-accuracy --city "London"
+```
+
+### Run from source (for development)
+
+```bash
+git clone https://github.com/mvrck19/idcweather
+cd idcweather
 pip install -r requirements.txt
+python weather_model_accuracy.py --city "London"
 ```
 
 ## Usage
+
+The examples below use `python weather_model_accuracy.py`, matching a from-source setup. If you installed via `pip install git+...`, use `weather-model-accuracy` instead — both forms take identical arguments.
 
 ### 🆕 Search by City Name (Easiest!)
 
