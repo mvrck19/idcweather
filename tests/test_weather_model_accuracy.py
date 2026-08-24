@@ -105,6 +105,20 @@ class TestFetchFunctions:
         assert result is None
 
     @responses.activate
+    def test_fetch_historical_forecast_rate_limited(self, capsys):
+        """Test rate-limited (429) historical forecast fetch is surfaced distinctly."""
+        responses.get(
+            "https://historical-forecast-api.open-meteo.com/v1/forecast",
+            json={"error": "Rate limited"},
+            status=429
+        )
+
+        result = fetch_historical_forecast(40.7128, -74.0060, "2025-01-01", "gfs_seamless")
+        assert result is None
+        captured = capsys.readouterr()
+        assert "429" in captured.out
+
+    @responses.activate
     def test_fetch_with_timeout(self):
         """Test fetch with timeout."""
         # Note: responses library doesn't easily simulate timeouts,
@@ -161,6 +175,29 @@ class TestAnalyzeModelAccuracy:
         # Results should be empty or have empty error lists
         assert isinstance(results, dict)
         assert isinstance(model_names, dict)
+
+    @responses.activate
+    def test_analyze_model_accuracy_multiple_days(self, sample_weather_data, sample_forecast_data):
+        """Test that errors accumulate correctly across multiple days via the shared executor."""
+        responses.get(
+            "https://archive-api.open-meteo.com/v1/archive",
+            json=sample_weather_data,
+            status=200
+        )
+        responses.get(
+            "https://historical-forecast-api.open-meteo.com/v1/forecast",
+            json=sample_forecast_data,
+            status=200
+        )
+
+        results, model_names = analyze_model_accuracy(40.7128, -74.0060, days_back=3)
+
+        assert isinstance(results, dict)
+        assert len(results) > 0
+        for model, errors in results.items():
+            assert len(errors["temp_errors"]) == 3
+            assert len(errors["precip_errors"]) == 3
+            assert len(errors["wind_errors"]) == 3
 
 
 class TestGetErrorColor:
@@ -310,6 +347,20 @@ class TestGeocoding:
 
         result = geocode_location("London")
         assert result is None
+
+    @responses.activate
+    def test_geocode_location_rate_limited(self, capsys):
+        """Test rate-limited (429) geocoding request is surfaced distinctly."""
+        responses.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            json={"error": "Rate limited"},
+            status=429
+        )
+
+        result = geocode_location("London")
+        assert result is None
+        captured = capsys.readouterr()
+        assert "429" in captured.out
 
 
 class TestForecast:

@@ -11,6 +11,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from statistics import mean
 from typing import Optional, Dict, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import typer
 from rich.console import Console
@@ -22,9 +23,15 @@ from rich import box
 console = Console()
 app = typer.Typer(help="Find the most accurate weather model for your location")
 
+# Shared session for connection pooling across all API calls
+SESSION = requests.Session()
+
 # Cache configuration
 CACHE_FILE = Path.home() / ".weather_model_cache.json"
 CACHE_EXPIRY_DAYS = 7
+
+# Cap on concurrent model fetches per day (conservative, to avoid burst throttling)
+MAX_WORKERS = 8
 
 
 def load_cache() -> Dict:
@@ -155,9 +162,13 @@ def fetch_historical_forecast(lat: float, lon: float, date: str, model: str) -> 
     }
 
     try:
-        response = requests.get(url, params=params, timeout=30)
+        response = SESSION.get(url, params=params, timeout=30)
         response.raise_for_status()
         return response.json()
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            console.print(f"[yellow]⚠ Rate limited by Open-Meteo (HTTP 429) fetching {model} for {date}.[/yellow]")
+        return None
     except Exception:
         return None
 
@@ -174,9 +185,13 @@ def fetch_actual_weather(lat: float, lon: float, date: str) -> Optional[Dict]:
     }
 
     try:
-        response = requests.get(url, params=params, timeout=30)
+        response = SESSION.get(url, params=params, timeout=30)
         response.raise_for_status()
         return response.json()
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            console.print(f"[yellow]⚠ Rate limited by Open-Meteo (HTTP 429) fetching actual weather for {date}.[/yellow]")
+        return None
     except Exception:
         return None
 
@@ -235,10 +250,14 @@ def geocode_location(city_name: str, count: int = 5) -> Optional[List[Dict]]:
     }
 
     try:
-        response = requests.get(url, params=params, timeout=10)
+        response = SESSION.get(url, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
         return data.get("results", [])
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            console.print(f"[yellow]⚠ Rate limited by Open-Meteo (HTTP 429) searching for '{city_name}'.[/yellow]")
+        return None
     except Exception:
         return None
 
@@ -321,9 +340,13 @@ def fetch_forecast(lat: float, lon: float, model: str, forecast_type: str = "dai
         }
 
     try:
-        response = requests.get(url, params=params, timeout=30)
+        response = SESSION.get(url, params=params, timeout=30)
         response.raise_for_status()
         return response.json()
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            console.print(f"[yellow]⚠ Rate limited by Open-Meteo (HTTP 429) fetching {model} forecast.[/yellow]")
+        return None
     except Exception:
         return None
 
@@ -601,57 +624,62 @@ def analyze_model_accuracy(lat: float, lon: float, days_back: int = 7) -> Tuple[
     ) as progress:
         task = progress.add_task("[cyan]Fetching and comparing data...", total=total_operations)
 
-        # Check each day in the past week
-        for day_offset in range(1, days_back + 1):
-            date = (datetime.now() - timedelta(days=day_offset)).strftime("%Y-%m-%d")
+        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(models))) as executor:
+            # Check each day in the past week
+            for day_offset in range(1, days_back + 1):
+                date = (datetime.now() - timedelta(days=day_offset)).strftime("%Y-%m-%d")
 
-            # Fetch actual weather
-            progress.update(task, description=f"[cyan]Fetching actual weather for {date}...")
-            actual_data = fetch_actual_weather(lat, lon, date)
-            progress.advance(task)
-
-            if not actual_data:
-                # Skip models for this day if we don't have actual data
-                progress.advance(task, advance=len(models))
-                continue
-
-            actual_temp = actual_data.get("hourly", {}).get("temperature_2m", [])
-            actual_precip = actual_data.get("hourly", {}).get("precipitation", [])
-            actual_wind = actual_data.get("hourly", {}).get("wind_speed_10m", [])
-
-            # Test each model
-            for model in models:
-                if model not in results:
-                    results[model] = {
-                        "temp_errors": [],
-                        "precip_errors": [],
-                        "wind_errors": []
-                    }
-
-                model_display_name = model_names.get(model, model)
-                progress.update(task, description=f"[cyan]Testing {model_display_name} for {date}...")
-
-                forecast_data = fetch_historical_forecast(lat, lon, date, model)
+                # Fetch actual weather
+                progress.update(task, description=f"[cyan]Fetching actual weather for {date}...")
+                actual_data = fetch_actual_weather(lat, lon, date)
                 progress.advance(task)
 
-                if not forecast_data:
+                if not actual_data:
+                    # Skip models for this day if we don't have actual data
+                    progress.advance(task, advance=len(models))
                     continue
 
-                forecast_temp = forecast_data.get("hourly", {}).get("temperature_2m", [])
-                forecast_precip = forecast_data.get("hourly", {}).get("precipitation", [])
-                forecast_wind = forecast_data.get("hourly", {}).get("wind_speed_10m", [])
+                actual_temp = actual_data.get("hourly", {}).get("temperature_2m", [])
+                actual_precip = actual_data.get("hourly", {}).get("precipitation", [])
+                actual_wind = actual_data.get("hourly", {}).get("wind_speed_10m", [])
 
-                # Calculate errors
-                temp_mae = calculate_mae(forecast_temp, actual_temp)
-                precip_mae = calculate_mae(forecast_precip, actual_precip)
-                wind_mae = calculate_mae(forecast_wind, actual_wind)
+                # Test each model concurrently
+                progress.update(task, description=f"[cyan]Testing {len(models)} models for {date}...")
 
-                if temp_mae is not None:
-                    results[model]["temp_errors"].append(temp_mae)
-                if precip_mae is not None:
-                    results[model]["precip_errors"].append(precip_mae)
-                if wind_mae is not None:
-                    results[model]["wind_errors"].append(wind_mae)
+                future_to_model = {
+                    executor.submit(fetch_historical_forecast, lat, lon, date, model): model
+                    for model in models
+                }
+                for future in as_completed(future_to_model):
+                    model = future_to_model[future]
+                    if model not in results:
+                        results[model] = {
+                            "temp_errors": [],
+                            "precip_errors": [],
+                            "wind_errors": []
+                        }
+
+                    forecast_data = future.result()
+                    progress.advance(task)
+
+                    if not forecast_data:
+                        continue
+
+                    forecast_temp = forecast_data.get("hourly", {}).get("temperature_2m", [])
+                    forecast_precip = forecast_data.get("hourly", {}).get("precipitation", [])
+                    forecast_wind = forecast_data.get("hourly", {}).get("wind_speed_10m", [])
+
+                    # Calculate errors
+                    temp_mae = calculate_mae(forecast_temp, actual_temp)
+                    precip_mae = calculate_mae(forecast_precip, actual_precip)
+                    wind_mae = calculate_mae(forecast_wind, actual_wind)
+
+                    if temp_mae is not None:
+                        results[model]["temp_errors"].append(temp_mae)
+                    if precip_mae is not None:
+                        results[model]["precip_errors"].append(precip_mae)
+                    if wind_mae is not None:
+                        results[model]["wind_errors"].append(wind_mae)
 
     return results, model_names
 
