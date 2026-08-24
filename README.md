@@ -27,15 +27,25 @@ No API key or account needed — it uses [Open-Meteo](https://open-meteo.com/)'s
 
 ### Install directly (recommended)
 
+Use [pipx](https://pypa.github.io/pipx/) — it installs the tool in its own isolated environment and automatically makes sure the command ends up on your `PATH`, on Windows, macOS, and Linux alike:
+
 ```bash
-pip install git+https://github.com/mvrck19/idcweather
+pipx install git+https://github.com/mvrck19/idcweather
 ```
 
-This puts a `weather-model-accuracy` command on your PATH — no cloning required:
+Don't have `pipx`? `python -m pip install --user pipx && pipx ensurepath`, then re-run the command above (open a new terminal afterward so the PATH change takes effect).
 
 ```bash
 weather-model-accuracy --city "London"
 ```
+
+### Alternative: plain pip
+
+```bash
+pip install git+https://github.com/mvrck19/idcweather
+```
+
+With plain `pip`, the `weather-model-accuracy` command may not be on your `PATH` afterward — this is general `pip`/Windows behavior (a user-site install's Scripts folder isn't on `PATH` by default), not specific to this tool. If the command isn't found after installing this way, use `pipx` above instead, or add your Python user Scripts/bin directory to `PATH` manually.
 
 ### Run from source (for development)
 
