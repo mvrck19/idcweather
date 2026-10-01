@@ -3,11 +3,16 @@
 import pytest
 import responses
 from datetime import datetime, timedelta
+from urllib.parse import parse_qs, urlparse
+
+from tests import fakes
 from weather_model_accuracy import (
+    MODELS,
     calculate_mae,
     fetch_historical_forecast,
     fetch_actual_weather,
     analyze_model_accuracy,
+    rank_models,
     get_error_color,
     geocode_location,
     fetch_forecast,
@@ -61,10 +66,22 @@ class TestFetchFunctions:
             status=200
         )
 
-        result = fetch_historical_forecast(40.7128, -74.0060, "2025-01-01", "gfs_seamless")
+        result = fetch_historical_forecast(40.7128, -74.0060, "2025-01-01", "2025-01-01", ["gfs_seamless"])
         assert result is not None
         assert "hourly" in result
         assert "temperature_2m" in result["hourly"]
+
+    @responses.activate
+    def test_fetch_historical_forecast_asks_for_all_models_and_days_at_once(self, sample_forecast_data):
+        """One request covers every model and the whole date range."""
+        responses.get("https://historical-forecast-api.open-meteo.com/v1/forecast", json=sample_forecast_data)
+
+        fetch_historical_forecast(40.7128, -74.0060, "2025-01-01", "2025-01-07", ["gfs_seamless", "icon_seamless"])
+
+        assert len(responses.calls) == 1
+        query = parse_qs(urlparse(responses.calls[0].request.url).query)
+        assert query["models"] == ["gfs_seamless,icon_seamless"]
+        assert (query["start_date"], query["end_date"]) == (["2025-01-01"], ["2025-01-07"])
 
     @responses.activate
     def test_fetch_historical_forecast_failure(self):
@@ -75,7 +92,7 @@ class TestFetchFunctions:
             status=404
         )
 
-        result = fetch_historical_forecast(40.7128, -74.0060, "2025-01-01", "gfs_seamless")
+        result = fetch_historical_forecast(40.7128, -74.0060, "2025-01-01", "2025-01-01", ["gfs_seamless"])
         assert result is None
 
     @responses.activate
@@ -87,7 +104,7 @@ class TestFetchFunctions:
             status=200
         )
 
-        result = fetch_actual_weather(40.7128, -74.0060, "2025-01-01")
+        result = fetch_actual_weather(40.7128, -74.0060, "2025-01-01", "2025-01-01")
         assert result is not None
         assert "hourly" in result
         assert "temperature_2m" in result["hourly"]
@@ -101,11 +118,11 @@ class TestFetchFunctions:
             status=404
         )
 
-        result = fetch_actual_weather(40.7128, -74.0060, "2025-01-01")
+        result = fetch_actual_weather(40.7128, -74.0060, "2025-01-01", "2025-01-01")
         assert result is None
 
     @responses.activate
-    def test_fetch_historical_forecast_rate_limited(self, capsys):
+    def test_fetch_historical_forecast_rate_limited(self, caplog):
         """Test rate-limited (429) historical forecast fetch is surfaced distinctly."""
         responses.get(
             "https://historical-forecast-api.open-meteo.com/v1/forecast",
@@ -113,10 +130,19 @@ class TestFetchFunctions:
             status=429
         )
 
-        result = fetch_historical_forecast(40.7128, -74.0060, "2025-01-01", "gfs_seamless")
+        result = fetch_historical_forecast(40.7128, -74.0060, "2025-01-01", "2025-01-01", ["gfs_seamless"])
         assert result is None
-        captured = capsys.readouterr()
-        assert "429" in captured.out
+        assert any("429" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+
+    @responses.activate
+    def test_fetch_retries_after_rate_limit(self, sample_forecast_data):
+        """A brief 429 burst limit is retried instead of losing that model's data."""
+        url = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+        responses.get(url, json={"error": "Rate limited"}, status=429)
+        responses.get(url, json=sample_forecast_data, status=200)
+
+        result = fetch_historical_forecast(40.7128, -74.0060, "2025-01-01", "2025-01-01", ["gfs_seamless"])
+        assert result == sample_forecast_data
 
     @responses.activate
     def test_fetch_with_timeout(self):
@@ -129,75 +155,62 @@ class TestFetchFunctions:
             status=200
         )
 
-        result = fetch_actual_weather(40.7128, -74.0060, "2025-01-01")
+        result = fetch_actual_weather(40.7128, -74.0060, "2025-01-01", "2025-01-01")
         assert result is not None
 
 
 class TestAnalyzeModelAccuracy:
     """Tests for analyze_model_accuracy function."""
 
+    @staticmethod
+    def mock_open_meteo(offsets):
+        responses.add_callback(responses.GET, fakes.ARCHIVE_URL, callback=fakes.archive)
+        responses.add_callback(responses.GET, fakes.HISTORICAL_URL, callback=fakes.historical(offsets))
+
     @responses.activate
-    def test_analyze_model_accuracy_basic(self, sample_weather_data, sample_forecast_data):
-        """Test basic model accuracy analysis."""
-        # Mock actual weather data
-        responses.get(
-            "https://archive-api.open-meteo.com/v1/archive",
-            json=sample_weather_data,
-            status=200
-        )
+    def test_two_requests_cover_all_models_and_days(self):
+        """The whole analysis costs one archive call and one forecast call, whatever the day count."""
+        self.mock_open_meteo({})
 
-        # Mock forecast data for all models
-        responses.get(
-            "https://historical-forecast-api.open-meteo.com/v1/forecast",
-            json=sample_forecast_data,
-            status=200
-        )
+        results, model_names = analyze_model_accuracy(40.7128, -74.0060, days_back=3)
 
-        # Run analysis with just 1 day
-        results, model_names = analyze_model_accuracy(40.7128, -74.0060, days_back=1)
+        assert len(responses.calls) == 2
+        assert set(results) == set(MODELS) == set(model_names)
+        for errors in results.values():
+            assert len(errors["temp_errors"]) == 3  # one score per day
+            assert len(errors["precip_errors"]) == 3
+            assert len(errors["wind_errors"]) == 3
 
-        assert isinstance(results, dict)
-        assert isinstance(model_names, dict)
-        assert len(model_names) > 0
+    @responses.activate
+    def test_scores_each_model_against_actual_weather(self):
+        self.mock_open_meteo({"gfs_seamless": 0.1, "icon_seamless": 1.0})
+
+        results, _ = analyze_model_accuracy(40.7128, -74.0060, days_back=3)
+        ranking = rank_models(results)
+
+        assert [model for model, _ in ranking[:2]] == ["gfs_seamless", "icon_seamless"]
+        assert ranking[0][1]["temp"] == pytest.approx(0.1)
+        assert ranking[-1][1]["overall"] == pytest.approx(3.0)
+
+    @responses.activate
+    def test_model_without_coverage_is_left_out(self):
+        """Regional models outside their area return nulls; they must not be ranked."""
+        self.mock_open_meteo({"ncep_hrrr_conus": None})
+
+        results, _ = analyze_model_accuracy(51.51, -0.13, days_back=3)
+
+        assert results["ncep_hrrr_conus"] == {"temp_errors": [], "precip_errors": [], "wind_errors": []}
+        assert "ncep_hrrr_conus" not in [model for model, _ in rank_models(results)]
 
     @responses.activate
     def test_analyze_model_accuracy_no_data(self):
         """Test analysis when no data is available."""
-        # Mock failed requests
-        responses.get(
-            "https://archive-api.open-meteo.com/v1/archive",
-            json={"error": "Not found"},
-            status=404
-        )
+        responses.get(fakes.ARCHIVE_URL, json={"error": "Not found"}, status=404)
+        responses.add_callback(responses.GET, fakes.HISTORICAL_URL, callback=fakes.historical({}))
 
-        results, model_names = analyze_model_accuracy(40.7128, -74.0060, days_back=1)
+        results, _ = analyze_model_accuracy(40.7128, -74.0060, days_back=1)
 
-        # Results should be empty or have empty error lists
-        assert isinstance(results, dict)
-        assert isinstance(model_names, dict)
-
-    @responses.activate
-    def test_analyze_model_accuracy_multiple_days(self, sample_weather_data, sample_forecast_data):
-        """Test that errors accumulate correctly across multiple days via the shared executor."""
-        responses.get(
-            "https://archive-api.open-meteo.com/v1/archive",
-            json=sample_weather_data,
-            status=200
-        )
-        responses.get(
-            "https://historical-forecast-api.open-meteo.com/v1/forecast",
-            json=sample_forecast_data,
-            status=200
-        )
-
-        results, model_names = analyze_model_accuracy(40.7128, -74.0060, days_back=3)
-
-        assert isinstance(results, dict)
-        assert len(results) > 0
-        for model, errors in results.items():
-            assert len(errors["temp_errors"]) == 3
-            assert len(errors["precip_errors"]) == 3
-            assert len(errors["wind_errors"]) == 3
+        assert rank_models(results) == []
 
 
 class TestGetErrorColor:
@@ -243,8 +256,8 @@ class TestIntegration:
         )
 
         # Fetch data
-        actual = fetch_actual_weather(40.7128, -74.0060, "2025-01-01")
-        forecast = fetch_historical_forecast(40.7128, -74.0060, "2025-01-01", "gfs_seamless")
+        actual = fetch_actual_weather(40.7128, -74.0060, "2025-01-01", "2025-01-01")
+        forecast = fetch_historical_forecast(40.7128, -74.0060, "2025-01-01", "2025-01-01", ["gfs_seamless"])
 
         assert actual is not None
         assert forecast is not None
@@ -349,7 +362,7 @@ class TestGeocoding:
         assert result is None
 
     @responses.activate
-    def test_geocode_location_rate_limited(self, capsys):
+    def test_geocode_location_rate_limited(self, caplog):
         """Test rate-limited (429) geocoding request is surfaced distinctly."""
         responses.get(
             "https://geocoding-api.open-meteo.com/v1/search",
@@ -359,8 +372,7 @@ class TestGeocoding:
 
         result = geocode_location("London")
         assert result is None
-        captured = capsys.readouterr()
-        assert "429" in captured.out
+        assert any("429" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
 
 
 class TestForecast:

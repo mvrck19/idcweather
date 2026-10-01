@@ -6,32 +6,40 @@ Compares different weather forecast models to find the most accurate one for a g
 
 import requests
 import json
+import logging
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
 from statistics import mean
 from typing import Optional, Dict, List, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import typer
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from rich.console import Console
+from rich.logging import RichHandler
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 from rich.panel import Panel
 from rich import box
 
 console = Console()
+log = logging.getLogger(__name__)
 app = typer.Typer(help="Find the most accurate weather model for your location")
 
-# Shared session for connection pooling across all API calls
+# Shared session for connection pooling across all API calls.
+# Open-Meteo answers bursts of parallel requests with 429; retry those (0s, then 1s backoff)
+# instead of silently scoring that model on fewer days. Retry-After is ignored so one
+# throttled call can't stall a whole API request.
 SESSION = requests.Session()
+SESSION.mount("https://", HTTPAdapter(max_retries=Retry(
+    total=2, backoff_factor=0.5, status_forcelist=[429],
+    respect_retry_after_header=False, raise_on_status=False,
+)))
 
 # Cache configuration
 CACHE_FILE = Path.home() / ".weather_model_cache.json"
 CACHE_EXPIRY_DAYS = 7
-
-# Cap on concurrent model fetches per day (conservative, to avoid burst throttling)
-MAX_WORKERS = 8
 
 
 def load_cache() -> Dict:
@@ -149,51 +157,60 @@ def show_cache() -> None:
     console.print(f"[dim]Cache expiry: {CACHE_EXPIRY_DAYS} days[/dim]")
 
 
-def fetch_historical_forecast(lat: float, lon: float, date: str, model: str) -> Optional[Dict]:
-    """Fetch historical forecast data from Open-Meteo API."""
-    url = "https://historical-forecast-api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "start_date": date,
-        "end_date": date,
-        "hourly": "temperature_2m,precipitation,wind_speed_10m",
-        "models": model
-    }
+def get_json(url: str, params: Dict, what: str, timeout: int = 30) -> Optional[Dict]:
+    """GET an Open-Meteo endpoint. On failure, log why and return None.
 
+    Open-Meteo explains errors in a JSON "reason" (e.g. which model ID is invalid), so it's logged.
+    """
     try:
-        response = SESSION.get(url, params=params, timeout=30)
+        response = SESSION.get(url, params=params, timeout=timeout)
         response.raise_for_status()
         return response.json()
     except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code == 429:
-            console.print(f"[yellow]⚠ Rate limited by Open-Meteo (HTTP 429) fetching {model} for {date}.[/yellow]")
-        return None
-    except Exception:
-        return None
+        try:
+            reason = e.response.json().get("reason", "")
+        except ValueError:
+            reason = e.response.text[:200]
+        log.warning("Open-Meteo HTTP %s fetching %s: %s", e.response.status_code, what, reason)
+    except (requests.RequestException, ValueError) as e:
+        log.warning("Fetching %s failed: %s", what, e)
+    return None
 
 
-def fetch_actual_weather(lat: float, lon: float, date: str) -> Optional[Dict]:
-    """Fetch actual weather data from Open-Meteo Historical Weather API."""
-    url = "https://archive-api.open-meteo.com/v1/archive"
-    params = {
+# Variables scored against actual weather, and the results key each one feeds
+SCORED_VARIABLES = {
+    "temperature_2m": "temp_errors",
+    "precipitation": "precip_errors",
+    "wind_speed_10m": "wind_errors",
+}
+
+
+def fetch_historical_forecast(lat: float, lon: float, start_date: str, end_date: str,
+                              models: List[str]) -> Optional[Dict]:
+    """Fetch what each model forecast for a past date range, all models in one request.
+
+    With several models, Open-Meteo suffixes each variable with the model ID
+    (temperature_2m_gfs_seamless); models with no coverage there come back as nulls.
+    """
+    return get_json("https://historical-forecast-api.open-meteo.com/v1/forecast", {
         "latitude": lat,
         "longitude": lon,
-        "start_date": date,
-        "end_date": date,
-        "hourly": "temperature_2m,precipitation,wind_speed_10m"
-    }
+        "start_date": start_date,
+        "end_date": end_date,
+        "hourly": ",".join(SCORED_VARIABLES),
+        "models": ",".join(models),
+    }, what="historical forecasts")
 
-    try:
-        response = SESSION.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code == 429:
-            console.print(f"[yellow]⚠ Rate limited by Open-Meteo (HTTP 429) fetching actual weather for {date}.[/yellow]")
-        return None
-    except Exception:
-        return None
+
+def fetch_actual_weather(lat: float, lon: float, start_date: str, end_date: str) -> Optional[Dict]:
+    """Fetch the observed weather for a past date range from the Historical Weather API."""
+    return get_json("https://archive-api.open-meteo.com/v1/archive", {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": start_date,
+        "end_date": end_date,
+        "hourly": ",".join(SCORED_VARIABLES),
+    }, what="actual weather")
 
 
 def calculate_mae(forecasted: List, actual: List) -> Optional[float]:
@@ -249,17 +266,8 @@ def geocode_location(city_name: str, count: int = 5) -> Optional[List[Dict]]:
         "format": "json"
     }
 
-    try:
-        response = SESSION.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        return data.get("results", [])
-    except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code == 429:
-            console.print(f"[yellow]⚠ Rate limited by Open-Meteo (HTTP 429) searching for '{city_name}'.[/yellow]")
-        return None
-    except Exception:
-        return None
+    data = get_json(url, params, what=f"places matching '{city_name}'", timeout=10)
+    return None if data is None else data.get("results", [])
 
 
 def select_location(locations: List[Dict]) -> Optional[Dict]:
@@ -339,16 +347,7 @@ def fetch_forecast(lat: float, lon: float, model: str, forecast_type: str = "dai
             "models": model
         }
 
-    try:
-        response = SESSION.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code == 429:
-            console.print(f"[yellow]⚠ Rate limited by Open-Meteo (HTTP 429) fetching {model} forecast.[/yellow]")
-        return None
-    except Exception:
-        return None
+    return get_json(url, params, what=f"{model} forecast")
 
 
 def display_forecast(forecast_data: Dict, model_name: str, location_str: str,
@@ -563,125 +562,72 @@ def display_hourly_forecast(forecast_data: Dict, model_name: str, location_str: 
     console.print("\n", table)
 
 
-def analyze_model_accuracy(lat: float, lon: float, days_back: int = 7) -> Tuple[Dict, Dict]:
-    """Analyze accuracy of different weather models over the past week."""
-    # Models to test (Open-Meteo supported models)
-    # Global models work everywhere, regional models have specific coverage areas
-    models = [
-        # Global Models
-        "ecmwf_ifs04",              # ECMWF IFS (Europe)
-        "gfs_seamless",             # NOAA GFS (US)
-        "icon_seamless",            # DWD ICON (Germany)
-        "gem_seamless",             # GEM (Canada)
-        "jma_seamless",             # JMA (Japan)
-        "meteofrance_seamless",     # Météo-France
-        "bom_access_global",        # BOM (Australia)
-        "cma_grapes_global",        # CMA GRAPES (China)
-        "ukmo_seamless",            # UK Met Office
+# Models to test (Open-Meteo model ID -> display name)
+# Global models work everywhere, regional models have specific coverage areas
+MODELS = {
+    # Global Models
+    "ecmwf_ifs025": "ECMWF IFS",  # ecmwf_ifs04 was retired; Open-Meteo returns it as all nulls
+    "gfs_seamless": "NOAA GFS",
+    "icon_seamless": "DWD ICON Global",
+    "gem_seamless": "GEM Canada",
+    "jma_seamless": "JMA Japan",
+    "meteofrance_seamless": "Météo-France",
+    "cma_grapes_global": "CMA GRAPES China",
+    "ukmo_seamless": "UK Met Office",
+    "arpege_seamless": "ARPEGE",
+    # bom_access_global left out: the historical API has no data for it anywhere
 
-        # Regional High-Resolution Models
-        "icon_eu",                  # ICON Europe (7km, Europe only)
-        "icon_d2",                  # ICON D2 (2km, Central Europe only)
-        "arpege_seamless",          # ARPEGE Europe (11km, Europe)
-        "arome_seamless",           # AROME France (2.5km, France)
-        "hrrr_seamless",            # HRRR (3km, US only)
-        "nam_seamless",             # NAM (3km, US only)
-    ]
+    # Regional High-Resolution Models (nulls outside their area, so they drop out of the ranking)
+    "icon_eu": "ICON Europe (7km)",           # Europe only
+    "icon_d2": "ICON D2 (2km)",               # Central Europe only
+    "arome_seamless": "AROME France (2.5km)", # France
+    "ncep_hrrr_conus": "HRRR US (3km)",       # US only
+    "ncep_nam_conus": "NAM US (3km)",         # US only
+}
+# Every ID must be valid: one unknown ID makes Open-Meteo reject the whole batched request.
 
-    # Display names for models
-    model_names = {
-        "ecmwf_ifs04": "ECMWF IFS",
-        "gfs_seamless": "NOAA GFS",
-        "icon_seamless": "DWD ICON Global",
-        "gem_seamless": "GEM Canada",
-        "jma_seamless": "JMA Japan",
-        "meteofrance_seamless": "Météo-France",
-        "bom_access_global": "BOM Australia",
-        "cma_grapes_global": "CMA GRAPES China",
-        "ukmo_seamless": "UK Met Office",
-        "icon_eu": "ICON Europe (7km)",
-        "icon_d2": "ICON D2 (2km)",
-        "arpege_seamless": "ARPEGE Europe",
-        "arome_seamless": "AROME France (2.5km)",
-        "hrrr_seamless": "HRRR US (3km)",
-        "nam_seamless": "NAM US (3km)",
-    }
 
-    results = {}
+def analyze_model_accuracy(lat: float, lon: float, days_back: int = 7,
+                           quiet: bool = False) -> Tuple[Dict, Dict]:
+    """Score every model against the observed weather for each of the past `days_back` days.
 
-    console.print(f"\n[bold cyan]Analyzing weather models for location ({lat}, {lon})[/bold cyan]")
-    console.print(f"Checking accuracy over the past {days_back} days with {len(models)} models\n")
+    Costs two Open-Meteo requests in total, run in parallel: the observed weather, and
+    all models' forecasts for the whole range. Returns
+    ({model: {"temp_errors": [one MAE per day], ...}}, {model: display name}).
 
-    # Calculate total operations
-    total_operations = days_back * (1 + len(models))  # 1 actual weather fetch + N model fetches per day
+    quiet=True suppresses the terminal output (for use from the API).
+    """
+    models = list(MODELS)
+    out = Console(quiet=True) if quiet else console
+    start = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    end = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console
-    ) as progress:
-        task = progress.add_task("[cyan]Fetching and comparing data...", total=total_operations)
+    out.print(f"\n[bold cyan]Analyzing weather models for location ({lat}, {lon})[/bold cyan]")
+    out.print(f"Checking accuracy over the past {days_back} days with {len(models)} models\n")
 
-        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(models))) as executor:
-            # Check each day in the past week
-            for day_offset in range(1, days_back + 1):
-                date = (datetime.now() - timedelta(days=day_offset)).strftime("%Y-%m-%d")
+    with out.status("[cyan]Fetching past forecasts and actual weather..."), ThreadPoolExecutor(2) as pool:
+        actual_job = pool.submit(fetch_actual_weather, lat, lon, start, end)
+        forecast_job = pool.submit(fetch_historical_forecast, lat, lon, start, end, models)
+        actual = (actual_job.result() or {}).get("hourly", {})
+        forecast = (forecast_job.result() or {}).get("hourly", {})
 
-                # Fetch actual weather
-                progress.update(task, description=f"[cyan]Fetching actual weather for {date}...")
-                actual_data = fetch_actual_weather(lat, lon, date)
-                progress.advance(task)
+    # Hour positions for each day, so every model gets one score per day
+    days: Dict[str, List[int]] = {}
+    for i, hour in enumerate(actual.get("time", [])):
+        days.setdefault(hour[:10], []).append(i)
 
-                if not actual_data:
-                    # Skip models for this day if we don't have actual data
-                    progress.advance(task, advance=len(models))
-                    continue
+    results = {model: {key: [] for key in SCORED_VARIABLES.values()} for model in models}
+    for model in models:
+        for variable, key in SCORED_VARIABLES.items():
+            predicted, observed = forecast.get(f"{variable}_{model}"), actual.get(variable)
+            if not predicted or not observed or len(predicted) != len(observed):
+                continue
+            for hours in days.values():
+                mae = calculate_mae([predicted[i] for i in hours], [observed[i] for i in hours])
+                if mae is not None:
+                    results[model][key].append(mae)
 
-                actual_temp = actual_data.get("hourly", {}).get("temperature_2m", [])
-                actual_precip = actual_data.get("hourly", {}).get("precipitation", [])
-                actual_wind = actual_data.get("hourly", {}).get("wind_speed_10m", [])
-
-                # Test each model concurrently
-                progress.update(task, description=f"[cyan]Testing {len(models)} models for {date}...")
-
-                future_to_model = {
-                    executor.submit(fetch_historical_forecast, lat, lon, date, model): model
-                    for model in models
-                }
-                for future in as_completed(future_to_model):
-                    model = future_to_model[future]
-                    if model not in results:
-                        results[model] = {
-                            "temp_errors": [],
-                            "precip_errors": [],
-                            "wind_errors": []
-                        }
-
-                    forecast_data = future.result()
-                    progress.advance(task)
-
-                    if not forecast_data:
-                        continue
-
-                    forecast_temp = forecast_data.get("hourly", {}).get("temperature_2m", [])
-                    forecast_precip = forecast_data.get("hourly", {}).get("precipitation", [])
-                    forecast_wind = forecast_data.get("hourly", {}).get("wind_speed_10m", [])
-
-                    # Calculate errors
-                    temp_mae = calculate_mae(forecast_temp, actual_temp)
-                    precip_mae = calculate_mae(forecast_precip, actual_precip)
-                    wind_mae = calculate_mae(forecast_wind, actual_wind)
-
-                    if temp_mae is not None:
-                        results[model]["temp_errors"].append(temp_mae)
-                    if precip_mae is not None:
-                        results[model]["precip_errors"].append(precip_mae)
-                    if wind_mae is not None:
-                        results[model]["wind_errors"].append(wind_mae)
-
-    return results, model_names
+    return results, dict(MODELS)
 
 
 def get_error_color(rank: int, total: int) -> str:
@@ -696,21 +642,12 @@ def get_error_color(rank: int, total: int) -> str:
         return "red"
 
 
-def display_results(results: Dict, model_names: Dict) -> Optional[Tuple[str, float]]:
-    """Display model accuracy results and return the best model ID and error score."""
-    console.print()
+def rank_models(results: Dict) -> List[Tuple[str, Dict]]:
+    """Average each model's errors and sort most accurate first.
 
-    # Filter out models with no data (e.g., regional models outside their coverage)
-    results = {k: v for k, v in results.items() if v["temp_errors"] or v["precip_errors"] or v["wind_errors"]}
-
-    if not results:
-        console.print("[yellow]No model data available for this location.[/yellow]")
-        return None
-
-    console.print(f"[bold]Tested {len(results)} models with available data for this location.[/bold]\n")
-
-    # Calculate average errors for each model
-    model_scores = {}
+    Models with no data (e.g., regional models outside their coverage) are dropped.
+    """
+    ranked = []
     for model, errors in results.items():
         avg_temp = mean(errors["temp_errors"]) if errors["temp_errors"] else None
         avg_precip = mean(errors["precip_errors"]) if errors["precip_errors"] else None
@@ -718,21 +655,30 @@ def display_results(results: Dict, model_names: Dict) -> Optional[Tuple[str, flo
 
         # Overall score (lower is better)
         score_components = [s for s in [avg_temp, avg_precip, avg_wind] if s is not None]
-        overall_score = mean(score_components) if score_components else None
+        if not score_components:
+            continue
 
-        model_scores[model] = {
-            "overall": overall_score,
+        ranked.append((model, {
+            "overall": mean(score_components),
             "temp": avg_temp,
             "precip": avg_precip,
             "wind": avg_wind
-        }
+        }))
 
-    # Sort by overall accuracy (lowest error = best)
-    sorted_models = sorted(
-        model_scores.items(),
-        key=lambda x: x[1]["overall"] if x[1]["overall"] is not None else float('inf')
-    )
-    sorted_models = [(m, s) for m, s in sorted_models if s["overall"] is not None]
+    return sorted(ranked, key=lambda x: x[1]["overall"])
+
+
+def display_results(results: Dict, model_names: Dict) -> Optional[Tuple[str, float]]:
+    """Display model accuracy results and return the best model ID and error score."""
+    console.print()
+
+    sorted_models = rank_models(results)
+
+    if not sorted_models:
+        console.print("[yellow]No model data available for this location.[/yellow]")
+        return None
+
+    console.print(f"[bold]Tested {len(sorted_models)} models with available data for this location.[/bold]\n")
 
     # Create results table
     table = Table(title="Weather Model Accuracy Rankings", box=box.ROUNDED, show_header=True, header_style="bold magenta")
@@ -808,6 +754,10 @@ def main(
 
     Supports caching to remember the best model for each location.
     """
+    # Show warnings (e.g. rate limiting) in the terminal UI
+    logging.basicConfig(level=logging.WARNING, format="%(message)s",
+                        handlers=[RichHandler(console=console, show_time=False, show_path=False)])
+
     # Handle cache management commands first
     if show_cache_flag:
         show_cache()
