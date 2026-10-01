@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weather</title>
+<meta name="description" content="7-day forecast for any city.">
+<link rel="preload" href="fonts/archivo-latin.woff2" as="font" type="font/woff2" crossorigin>
+<style>
+  /* Archivo (SIL OFL, fonts/OFL.txt), self-hosted so visitors' IPs don't go to Google
+     and the page doesn't wait on a third-party stylesheet */
+  @font-face {
+    font-family: Archivo;
+    font-weight: 100 900;
+    font-stretch: 62% 125%;
+    font-display: swap;
+    src: url(fonts/archivo-latin.woff2) format('woff2');
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+  }
+  @font-face {
+    font-family: Archivo;
+    font-weight: 100 900;
+    font-stretch: 62% 125%;
+    font-display: swap;
+    src: url(fonts/archivo-latin-ext.woff2) format('woff2');
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+  }
+
+  :root {
+    --paper: #edf1f2;
+    --field: #ffffff;
+    --ink: #18283a;
+    --ink-soft: #5a6b7c;
+    --line: #c9d3d9;
+    --warm: #c43d33;  /* warm front */
+    --cold: #2867b2;  /* cold front */
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #101c29;
+      --field: #172636;
+      --ink: #e4eaee;
+      --ink-soft: #93a3b2;
+      --line: #2a3a4b;
+      --warm: #f07a6e;
+      --cold: #6fa6e8;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 400 1.0625rem/1.5 Archivo, system-ui, sans-serif;
+  }
+  main { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1rem 4rem; }
+  :focus-visible { outline: 3px solid var(--cold); outline-offset: 2px; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+  /* Search */
+  form { display: flex; flex-wrap: wrap; gap: .5rem; }
+  input, button { font: inherit; color: inherit; }
+  input {
+    flex: 1 1 14rem;
+    padding: .7rem .9rem;
+    font-size: 1.125rem;
+    background: var(--field);
+    border: 2px solid var(--ink);
+    border-radius: 6px;
+  }
+  form button {
+    padding: .7rem 1rem;
+    background: none;
+    border: 2px solid var(--line);
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  form button:hover { border-color: var(--ink); }
+
+  #results { list-style: none; margin: .25rem 0 0; padding: 0; }
+  #results button {
+    display: block; width: 100%;
+    padding: .6rem .9rem;
+    text-align: left;
+    background: none; border: 0; border-radius: 6px;
+    cursor: pointer;
+  }
+  #results button:hover, #results button:focus-visible { background: var(--line); }
+  #results small { color: var(--ink-soft); font-size: .9375rem; }
+
+  #status { min-height: 1.5em; margin: .75rem 0 0; color: var(--ink-soft); }
+
+  /* Hero */
+  h1 {
+    margin: 1.5rem 0 .25rem;
+    font-size: clamp(2.75rem, 11vw, 5.5rem);
+    font-stretch: 62%;
+    font-weight: 800;
+    line-height: .95;
+    letter-spacing: -.01em;
+    overflow-wrap: anywhere;
+  }
+  #region { margin: 1.5rem 0 0; color: var(--ink-soft); }
+  #region + h1 { margin-top: .1rem; }
+  #now { margin: 0; font-size: 1.5rem; font-stretch: 87%; }
+
+  .front { display: block; margin: 1.75rem 0 1rem; }
+  .front .w { stroke: var(--warm); fill: var(--warm); }
+  .front .c { stroke: var(--cold); fill: var(--cold); }
+
+  /* Days */
+  #days {
+    list-style: none; margin: 0; padding: 0;
+    font-variant-numeric: tabular-nums;
+  }
+  #days li {
+    display: grid;
+    grid-template-columns: 3rem 1.75rem 2.25rem minmax(0, 1fr) 2.25rem;
+    grid-template-areas: "day icon lo bar hi" ". meta meta meta meta";
+    align-items: center;
+    column-gap: .6rem;
+    padding: .65rem 0;
+  }
+  .day { grid-area: day; font-weight: 600; font-stretch: 87%; }
+  .icon { grid-area: icon; font-size: 1.25rem; text-align: center; }
+  .lo { grid-area: lo; color: var(--cold); text-align: right; font-stretch: 87%; }
+  .hi { grid-area: hi; color: var(--warm); font-weight: 600; font-stretch: 87%; }
+  .bar { grid-area: bar; position: relative; height: 6px; background: var(--line); border-radius: 3px; }
+  .bar i {
+    position: absolute; top: 0; bottom: 0;
+    background: var(--ink); border-radius: 3px;
+    transform-origin: left;
+    animation: grow .45s ease-out both;
+  }
+  @keyframes grow { from { transform: scaleX(0); } }
+  .meta { grid-area: meta; display: flex; gap: 1rem; color: var(--ink-soft); font-size: .9375rem; }
+  .rain { color: var(--cold); }
+
+  @media (min-width: 600px) {
+    main { padding-inline: 2rem; }
+    #days li {
+      grid-template-columns: 3.25rem 1.75rem minmax(0, 1fr) 2.25rem minmax(4rem, 9rem) 2.25rem 4.25rem 4.5rem;
+      grid-template-areas: "day icon desc lo bar hi rain wind";
+    }
+    .meta { display: contents; }
+    .desc { grid-area: desc; }
+    .rain { grid-area: rain; text-align: right; }
+    .wind { grid-area: wind; text-align: right; }
+  }
+
+  #source, #compare, .credit { color: var(--ink-soft); font-size: .9375rem; }
+  #source { margin: 1.5rem 0 0; max-width: 38rem; }
+  #compare { margin-top: .75rem; }
+  #compare summary { cursor: pointer; color: var(--ink); }
+  #compare table { width: 100%; max-width: 32rem; margin-top: .5rem; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  #compare th, #compare td { padding: .3rem 0 .3rem .75rem; text-align: right; }
+  #compare th:first-child, #compare td:first-child { padding-left: 0; text-align: left; }
+  #compare th { font-weight: 400; }
+  #compare thead th { font-weight: 600; }
+  #compare tbody tr:first-child { color: var(--ink); font-weight: 600; }
+  .credit { margin: 1rem 0 0; }
+  .credit a { color: inherit; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .bar i { animation: none; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <form id="search" role="search">
+    <label for="q" class="sr">City</label>
+    <input id="q" type="search" placeholder="Search a city" autocomplete="off" spellcheck="false">
+    <button type="button" id="locate">Use my location</button>
+  </form>
+  <ul id="results" hidden></ul>
+  <p id="status" role="status"></p>
+
+  <section id="intro">
+    <h1>7-day forecast</h1>
+    <p>Search for a city, or use your location.</p>
+  </section>
+
+  <section id="forecast" hidden>
+    <p id="region"></p>
+    <h1 id="place"></h1>
+    <p id="now"></p>
+    <svg class="front" aria-hidden="true" width="100%" height="16">
+      <defs>
+        <pattern id="front" width="40" height="16" patternUnits="userSpaceOnUse">
+          <path class="w" d="M0 8H20" stroke-width="2"/>
+          <path class="w" d="M5 8a5 5 0 0 1 10 0z" stroke="none"/>
+          <path class="c" d="M20 8H40" stroke-width="2"/>
+          <path class="c" d="M25 8l5 6 5-6z" stroke="none"/>
+        </pattern>
+      </defs>
+      <rect width="100%" height="16" fill="url(#front)"/>
+    </svg>
+    <ol id="days"></ol>
+    <p id="source" aria-live="polite"></p>
+    <details id="compare" hidden>
+      <summary>Compare all <span id="model-count"></span> models</summary>
+      <table>
+        <thead><tr><th scope="col">Model</th><th scope="col">Temp</th><th scope="col">Rain</th><th scope="col">Wind</th></tr></thead>
+        <tbody id="ranking"></tbody>
+      </table>
+      <p>How far each model's hourly forecasts were off, on average, over the past week. Lower is better.</p>
+    </details>
+    <p class="credit">Weather data by <a href="https://open-meteo.com/">Open-Meteo</a>.</p>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
