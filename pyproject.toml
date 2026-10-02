@@ -13,8 +13,14 @@ dependencies = [
     "typer>=0.9.0",
 ]
 
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+]
+
 [project.scripts]
 weather-model-accuracy = "weather_model_accuracy:app"
 
 [tool.setuptools]
-py-modules = ["weather_model_accuracy"]
+py-modules = ["weather_model_accuracy", "weather_api"]

@@ -5,18 +5,18 @@ A Python tool that helps you find the most accurate weather forecast model for y
 ## ✨ Features
 
 - 🔍 **City Search** - Just type a city name, no coordinates needed
-- 📊 **15 Weather Models** - Compares global models (ECMWF, GFS, ICON, etc.) + regional high-res models
+- 📊 **14 Weather Models** - Compares global models (ECMWF, GFS, ICON, etc.) + regional high-res models
 - 🎯 **Accuracy Analysis** - Tests which model performed best for YOUR location over the past week
 - 🌤️ **Smart Forecast** - Daily (3-14 days) OR hourly (24-120 hours) forecasts
 - 💾 **Intelligent Caching** - Remembers the best model for each location (7-day cache)
-- 🎨 **Beautiful CLI** - Rich terminal UI with colors, progress bars, and emoji weather icons
-- ⚡ **Comprehensive Testing** - 38 tests with 100% pass rate
+- 🎨 **Beautiful CLI** - Rich terminal UI with colors and emoji weather icons
+- ⚡ **Tested** - Unit and API tests, run in CI on every push
 
 ## Concept
 
 Different weather models perform differently across regions. This tool:
 1. Takes your location (city name or coordinates)
-2. Fetches the past week's forecasts from 15 models
+2. Fetches the past week's forecasts from 14 models (two requests in total)
 3. Compares them against actual weather data
 4. Ranks models by accuracy for YOUR area
 5. Shows you a 7-day forecast using the best model
@@ -121,7 +121,7 @@ python weather_model_accuracy.py -c "Berlin" -ft hourly -fh 48
 The tool **automatically caches** the best model for each location for 7 days:
 
 ```bash
-# First run: Analyzes all 15 models (takes time)
+# First run: Analyzes all 14 models (about a second)
 python weather_model_accuracy.py -c "London"
 
 # Second run (within 7 days): Uses cached result (instant!)
@@ -144,12 +144,34 @@ python weather_model_accuracy.py --clear-cache
 - 📅 Auto-expires after 7 days
 - 💽 Stored in `~/.weather_model_cache.json`
 
+## Web API
+
+The same analysis over HTTP, for the website or any other project:
+
+```bash
+pip install ".[api]"
+uvicorn weather_api:app --reload
+# GET http://localhost:8000/best-model?lat=51.51&lon=-0.13   (interactive docs at /docs)
+```
+
+Or as a container: `docker build -t idcweather-api . && docker run -p 8000:8000 idcweather-api`.
+CI builds, smoke-tests and publishes the image to `ghcr.io/mvrck19/idcweather-api` on every push to `master`.
+
+## Website
+
+`web/` is a static page: an instant forecast from Open-Meteo, upgraded to the most accurate model once the API answers.
+
+```bash
+cd web && python -m http.server 8765   # http://localhost:8765
+npm install && npm test                # Playwright tests
+```
+
 ## Output
 
 ### Model Accuracy Analysis
 
 The tool features a beautiful, colorized CLI output with:
-- **Progress bar** showing real-time data fetching status (15 models tested)
+- **Spinner** while the past week of forecasts and observations downloads
 - **Ranked table** with medal indicators (🥇🥈🥉) for top 3 models
 - **Color-coded accuracy** (green = best, yellow = good, orange = moderate, red = poor)
 - **Detailed metrics** for each model:
@@ -261,7 +283,7 @@ pytest -v
 
 ### Test Coverage
 
-The test suite includes **38 tests** covering:
+The test suite covers:
 - Unit tests for MAE calculations
 - Mocked API requests (using `responses` library)
 - Integration tests for the full workflow
@@ -333,5 +355,4 @@ python weather_model_accuracy.py --show-cache
 - Free API has rate limits
 - Accuracy depends on data availability for your region
 - Regional models only provide data within their coverage area (e.g., HRRR works only in US)
-- More models = longer analysis time (15 models tested)
 - Cache is location-based (rounded to ~1km precision)
